@@ -1,63 +1,22 @@
 // Desktop auth extraction approach inspired by:
 // - slacktokens: https://github.com/hraftery/slacktokens
 import { cp, mkdir, rm, unlink } from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  copyFileSync,
+  writeFileSync,
+  unlinkSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
-import { pbkdf2Sync, createDecipheriv } from "node:crypto";
+import { createDecipheriv, randomUUID } from "node:crypto";
 import { homedir, platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { findKeysContaining } from "../lib/leveldb-reader.js";
-
-type SqliteRow = Record<string, unknown>;
-
-function isMissingBunSqliteModule(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const err = error as { code?: unknown; message?: unknown };
-  const code = typeof err.code === "string" ? err.code : "";
-  const message = typeof err.message === "string" ? err.message : "";
-
-  if (code === "ERR_MODULE_NOT_FOUND" || code === "ERR_UNSUPPORTED_ESM_URL_SCHEME") {
-    return true;
-  }
-  if (!message.includes("bun:sqlite")) {
-    return false;
-  }
-  return (
-    message.includes("Cannot find module") ||
-    message.includes("Unknown builtin module") ||
-    message.includes("unsupported URL scheme") ||
-    message.includes("Only URLs with a scheme in")
-  );
-}
-
-/**
- * Query a SQLite database in read-only mode.
- * Uses bun:sqlite when running under Bun, falls back to node:sqlite (Node >= 22.5).
- */
-async function queryReadonlySqlite(dbPath: string, sql: string): Promise<SqliteRow[]> {
-  try {
-    const { Database } = await import("bun:sqlite");
-    const db = new Database(dbPath, { readonly: true });
-    try {
-      return db.query(sql).all() as SqliteRow[];
-    } finally {
-      db.close();
-    }
-  } catch (error) {
-    if (!isMissingBunSqliteModule(error)) {
-      throw error;
-    }
-    const { DatabaseSync } = await import("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    try {
-      return db.prepare(sql).all() as SqliteRow[];
-    } finally {
-      db.close();
-    }
-  }
-}
+import { isRecord } from "../lib/object-type-guards.ts";
+import { queryReadonlySqlite } from "./firefox-profile.ts";
+import { decryptChromiumCookieValue } from "./chromium-cookie.ts";
 
 type DesktopTeam = { url: string; name?: string; token: string };
 
@@ -109,10 +68,7 @@ const SLACK_SUPPORT_DIR_WIN_APPDATA = join(
  * so we search for the matching prefix.
  */
 function getWindowsStoreSlackPath(): string | null {
-  const pkgBase = join(
-    process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
-    "Packages",
-  );
+  const pkgBase = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "Packages");
   try {
     const entries = readdirSync(pkgBase);
     const slackPkg = entries.find((e) => e.startsWith("com.tinyspeck.slackdesktop_"));
@@ -125,7 +81,7 @@ function getWindowsStoreSlackPath(): string | null {
   return null;
 }
 
-function getSlackPaths(): { leveldbDir: string; cookiesDb: string; baseDir: string } {
+function getAllSlackPaths(): { leveldbDir: string; cookiesDb: string; baseDir: string }[] {
   let candidates: string[];
   if (IS_MACOS) {
     candidates = [SLACK_SUPPORT_DIR_ELECTRON, SLACK_SUPPORT_DIR_APPSTORE];
@@ -145,23 +101,24 @@ function getSlackPaths(): { leveldbDir: string; cookiesDb: string; baseDir: stri
     throw new Error(`Slack Desktop extraction is not supported on ${PLATFORM}.`);
   }
 
+  const results: { leveldbDir: string; cookiesDb: string; baseDir: string }[] = [];
   for (const dir of candidates) {
     const leveldbDir = join(dir, "Local Storage", "leveldb");
     if (existsSync(leveldbDir)) {
       const cookiesDbCandidates = [join(dir, "Network", "Cookies"), join(dir, "Cookies")];
       const cookiesDb =
         cookiesDbCandidates.find((candidate) => existsSync(candidate)) || cookiesDbCandidates[0]!;
-      return { leveldbDir, cookiesDb, baseDir: dir };
+      results.push({ leveldbDir, cookiesDb, baseDir: dir });
     }
   }
 
-  throw new Error(
-    `Slack Desktop data not found. Checked:\n  - ${candidates.map((d) => join(d, "Local Storage", "leveldb")).join("\n  - ")}`,
-  );
-}
+  if (results.length === 0) {
+    throw new Error(
+      `Slack Desktop data not found. Checked:\n  - ${candidates.map((d) => join(d, "Local Storage", "leveldb")).join("\n  - ")}`,
+    );
+  }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return results;
 }
 
 function toDesktopTeam(value: unknown): DesktopTeam | null {
@@ -360,40 +317,6 @@ function getSafeStoragePasswords(prefix: string): string[] {
   throw new Error("Could not read Safe Storage password from desktop keychain.");
 }
 
-function decryptChromiumCookieValue(data: Buffer, password: string): string {
-  if (!data || data.length === 0) {
-    return "";
-  }
-
-  const salt = Buffer.from("saltysalt", "utf8");
-  const iv = Buffer.alloc(16, " ");
-  const key = pbkdf2Sync(password, salt, IS_LINUX ? 1 : 1003, 16, "sha1");
-
-  const decipher = createDecipheriv("aes-128-cbc", key, iv);
-  decipher.setAutoPadding(true);
-  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
-  const marker = Buffer.from("xoxd-");
-  const idx = plain.indexOf(marker);
-  if (idx === -1) {
-    return plain.toString("utf8");
-  }
-
-  let end = idx;
-  while (end < plain.length) {
-    const b = plain[end]!;
-    if (b < 0x21 || b > 0x7e) {
-      break;
-    }
-    end++;
-  }
-  const rawToken = plain.subarray(idx, end).toString("utf8");
-  try {
-    return decodeURIComponent(rawToken);
-  } catch {
-    return rawToken;
-  }
-}
-
 /**
  * Decrypt a Chromium cookie on Windows using DPAPI + AES-256-GCM.
  *
@@ -409,18 +332,25 @@ function decryptCookieWindows(encrypted: Buffer, slackDataDir: string): string {
   if (!existsSync(localStatePath)) {
     throw new Error(`Local State file not found: ${localStatePath}`);
   }
-  const localState = JSON.parse(readFileSync(localStatePath, "utf8"));
-  if (!localState.os_crypt?.encrypted_key) {
+  let localState: unknown;
+  try {
+    localState = JSON.parse(readFileSync(localStatePath, "utf8"));
+  } catch (error) {
+    throw new Error(`Failed to parse Local State file: ${localStatePath}`, { cause: error });
+  }
+  const osCrypt = isRecord(localState) ? localState.os_crypt : undefined;
+  if (!isRecord(osCrypt) || typeof osCrypt.encrypted_key !== "string") {
     throw new Error("No os_crypt.encrypted_key in Local State");
   }
-  const encKeyFull = Buffer.from(localState.os_crypt.encrypted_key, "base64");
+  const encKeyFull = Buffer.from(osCrypt.encrypted_key as string, "base64");
   // Skip "DPAPI" prefix (5 bytes)
   const encKeyBlob = encKeyFull.subarray(5);
 
   // Decrypt AES key via Windows DPAPI using PowerShell
-  const encKeyFile = join(tmpdir(), `as-key-enc-${Date.now()}.bin`);
-  const decKeyFile = join(tmpdir(), `as-key-dec-${Date.now()}.bin`);
-  writeFileSync(encKeyFile, encKeyBlob);
+  const id = randomUUID();
+  const encKeyFile = join(tmpdir(), `as-key-enc-${id}.bin`);
+  const decKeyFile = join(tmpdir(), `as-key-dec-${id}.bin`);
+  writeFileSync(encKeyFile, encKeyBlob, { mode: 0o600 });
   try {
     // Escape single quotes for PowerShell single-quoted strings (' → '')
     const psEncKeyFile = encKeyFile.replaceAll("'", "''");
@@ -431,7 +361,9 @@ function decryptCookieWindows(encrypted: Buffer, slackDataDir: string): string {
       "$d=[System.Security.Cryptography.ProtectedData]::Unprotect($e,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)",
       `[System.IO.File]::WriteAllBytes('${psDecKeyFile}',$d)`,
     ].join("; ");
-    execFileSync("powershell", ["-ExecutionPolicy", "Bypass", "-Command", psCmd], { stdio: "pipe" });
+    execFileSync("powershell", ["-ExecutionPolicy", "Bypass", "-Command", psCmd], {
+      stdio: "pipe",
+    });
     if (!existsSync(decKeyFile)) {
       throw new Error("DPAPI decryption failed: PowerShell did not produce the decrypted key file");
     }
@@ -440,8 +372,8 @@ function decryptCookieWindows(encrypted: Buffer, slackDataDir: string): string {
     // AES-256-GCM: v10(3) + nonce(12) + ciphertext(N-16) + tag(16)
     const nonce = encrypted.subarray(3, 15);
     const ciphertextWithTag = encrypted.subarray(15);
-    const tag = ciphertextWithTag.subarray(ciphertextWithTag.length - 16);
-    const ciphertext = ciphertextWithTag.subarray(0, ciphertextWithTag.length - 16);
+    const tag = ciphertextWithTag.subarray(-16);
+    const ciphertext = ciphertextWithTag.subarray(0, -16);
 
     const decipher = createDecipheriv("aes-256-gcm", aesKey, nonce);
     decipher.setAuthTag(tag);
@@ -450,8 +382,16 @@ function decryptCookieWindows(encrypted: Buffer, slackDataDir: string): string {
 
     return decrypted;
   } finally {
-    try { unlinkSync(encKeyFile); } catch { /* ignore */ }
-    try { unlinkSync(decKeyFile); } catch { /* ignore */ }
+    try {
+      unlinkSync(encKeyFile);
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(decKeyFile);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -485,7 +425,11 @@ async function extractCookieDFromSlackCookiesDb(
     )) as typeof rows;
   } finally {
     if (IS_WIN32 && dbPathToQuery !== cookiesPath) {
-      try { unlinkSync(dbPathToQuery); } catch { /* ignore */ }
+      try {
+        unlinkSync(dbPathToQuery);
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -524,7 +468,7 @@ async function extractCookieDFromSlackCookiesDb(
 
   for (const password of passwords) {
     try {
-      const decrypted = decryptChromiumCookieValue(data, password);
+      const decrypted = decryptChromiumCookieValue(data, password, IS_LINUX ? 1 : 1003);
       const match = decrypted.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
       if (match) {
         return match[0]!;
@@ -538,12 +482,25 @@ async function extractCookieDFromSlackCookiesDb(
 }
 
 export async function extractFromSlackDesktop(): Promise<DesktopExtracted> {
-  const { leveldbDir, cookiesDb, baseDir } = getSlackPaths();
-  const teams = await extractTeamsFromSlackLevelDb(leveldbDir);
-  const cookie_d = await extractCookieDFromSlackCookiesDb(cookiesDb, baseDir);
-  return {
-    cookie_d,
-    teams,
-    source: { leveldb_path: leveldbDir, cookies_path: cookiesDb },
-  };
+  const allPaths = getAllSlackPaths();
+
+  // Try each candidate path; use the first one where both LevelDB and cookie extraction succeed.
+  const errors: string[] = [];
+  for (const { leveldbDir, cookiesDb, baseDir } of allPaths) {
+    try {
+      const teams = await extractTeamsFromSlackLevelDb(leveldbDir);
+      const cookie_d = await extractCookieDFromSlackCookiesDb(cookiesDb, baseDir);
+      return {
+        cookie_d,
+        teams,
+        source: { leveldb_path: leveldbDir, cookies_path: cookiesDb },
+      };
+    } catch (err: unknown) {
+      errors.push(`${baseDir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  throw new Error(
+    `Could not extract Slack Desktop credentials from any location:\n  - ${errors.join("\n  - ")}`,
+  );
 }

@@ -10,12 +10,14 @@ description: |
   - Listing channels/conversations; creating channels and inviting users
   - Fetching a Slack canvas as markdown
   - Looking up Slack users
+  - Opening DM or group DM channels
   Triggers: "slack message", "slack thread", "slack URL", "slack link", "read slack", "reply on slack", "search slack", "channel history", "recent messages", "channel messages", "latest messages"
 ---
 
 # Slack automation with `agent-slack`
 
-`agent-slack` is a CLI binary installed on `$PATH`. Invoke it directly (e.g. `agent-slack user list`)
+`agent-slack` is a CLI binary installed on `$PATH`. Invoke it directly (e.g. `agent-slack user list`).
+If installed via Nix flake only, run commands with `nix run github:stablyai/agent-slack -- <args>`.
 
 ## Quick start (auth)
 
@@ -111,8 +113,15 @@ agent-slack message draft "https://workspace.slack.com/archives/C123/p1700000000
 
 ```bash
 agent-slack message send "https://workspace.slack.com/archives/C123/p1700000000000000" "I can take this."
+agent-slack message send "#alerts-staging" "here's the report" --attach ./report.md
 agent-slack message edit "https://workspace.slack.com/archives/C123/p1700000000000000" "I can take this today."
 agent-slack message delete "https://workspace.slack.com/archives/C123/p1700000000000000"
+
+# Bullet lists are auto-detected and rendered as native Slack rich text:
+agent-slack message send "#general" "Here's the plan:
+- Step 1: do the thing
+- Step 2: verify it worked
+  - Sub-step: check logs"
 agent-slack message react add "https://workspace.slack.com/archives/C123/p1700000000000000" "eyes"
 agent-slack message react remove "https://workspace.slack.com/archives/C123/p1700000000000000" "eyes"
 ```
@@ -123,6 +132,10 @@ Channel mode for edit/delete requires `--ts`:
 agent-slack message edit "#general" "Updated text" --workspace "myteam" --ts "1770165109.628379"
 agent-slack message delete "#general" --workspace "myteam" --ts "1770165109.628379"
 ```
+
+Attach options for `message send`:
+
+- `--attach <path>` upload a local file (repeatable)
 
 ## List channels + create/invite users
 
@@ -157,6 +170,15 @@ If you have multiple workspaces configured and you use a channel **name** (`#gen
 ```bash
 agent-slack message get "#general" --workspace "https://myteam.slack.com" --ts "1770165109.628379"
 agent-slack message get "#general" --workspace "myteam" --ts "1770165109.628379"
+```
+
+## DM / group DM channels
+
+Get the channel ID for a DM or group DM, useful for sending messages to a group of users:
+
+```bash
+agent-slack user dm-open @alice @bob
+agent-slack user dm-open U01AAAA U02BBBB U03CCCC
 ```
 
 ## Canvas + Users

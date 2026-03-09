@@ -1,8 +1,10 @@
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { pbkdf2Sync, createDecipheriv } from "node:crypto";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { queryReadonlySqlite } from "./firefox-profile.ts";
+import { decryptChromiumCookieValue } from "./chromium-cookie.ts";
+import { isRecord } from "../lib/object-type-guards.ts";
 
 type BraveExtractedTeam = { url: string; name?: string; token: string };
 
@@ -15,12 +17,8 @@ const IS_MACOS = platform() === "darwin";
 
 // --- AppleScript helpers (for extracting teams from Brave tabs) ---
 
-function escapeOsaScript(script: string): string {
-  return script.replace(/'/g, `'"'"'`);
-}
-
 function osascript(script: string): string {
-  return execSync(`osascript -e '${escapeOsaScript(script)}'`, {
+  return execFileSync("osascript", ["-e", script], {
     encoding: "utf8",
     timeout: 7000,
     stdio: ["ignore", "pipe", "pipe"],
@@ -50,10 +48,6 @@ function teamsScript(): string {
       return "{}"
     end tell
   `;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }
 
 function toBraveTeam(value: unknown): BraveExtractedTeam | null {
@@ -96,53 +90,6 @@ const BRAVE_COOKIES_DB = join(
   "Cookies",
 );
 
-function isMissingBunSqliteModule(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const err = error as { code?: unknown; message?: unknown };
-  const code = typeof err.code === "string" ? err.code : "";
-  const message = typeof err.message === "string" ? err.message : "";
-
-  if (code === "ERR_MODULE_NOT_FOUND" || code === "ERR_UNSUPPORTED_ESM_URL_SCHEME") {
-    return true;
-  }
-  if (!message.includes("bun:sqlite")) {
-    return false;
-  }
-  return (
-    message.includes("Cannot find module") ||
-    message.includes("Unknown builtin module") ||
-    message.includes("unsupported URL scheme") ||
-    message.includes("Only URLs with a scheme in")
-  );
-}
-
-type SqliteRow = Record<string, unknown>;
-
-async function queryReadonlySqlite(dbPath: string, sql: string): Promise<SqliteRow[]> {
-  try {
-    const { Database } = await import("bun:sqlite");
-    const db = new Database(dbPath, { readonly: true });
-    try {
-      return db.query(sql).all() as SqliteRow[];
-    } finally {
-      db.close();
-    }
-  } catch (error) {
-    if (!isMissingBunSqliteModule(error)) {
-      throw error;
-    }
-    const { DatabaseSync } = await import("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    try {
-      return db.prepare(sql).all() as SqliteRow[];
-    } finally {
-      db.close();
-    }
-  }
-}
-
 function getSafeStoragePasswords(): string[] {
   const services = [
     "Brave Safe Storage",
@@ -165,40 +112,6 @@ function getSafeStoragePasswords(): string[] {
     }
   }
   return passwords;
-}
-
-function decryptChromiumCookieValue(data: Buffer, password: string): string {
-  if (!data || data.length === 0) {
-    return "";
-  }
-
-  const salt = Buffer.from("saltysalt", "utf8");
-  const iv = Buffer.alloc(16, " ");
-  const key = pbkdf2Sync(password, salt, 1003, 16, "sha1");
-
-  const decipher = createDecipheriv("aes-128-cbc", key, iv);
-  decipher.setAutoPadding(true);
-  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
-  const marker = Buffer.from("xoxd-");
-  const idx = plain.indexOf(marker);
-  if (idx === -1) {
-    return plain.toString("utf8");
-  }
-
-  let end = idx;
-  while (end < plain.length) {
-    const b = plain[end]!;
-    if (b < 0x21 || b > 0x7e) {
-      break;
-    }
-    end++;
-  }
-  const rawToken = plain.subarray(idx, end).toString("utf8");
-  try {
-    return decodeURIComponent(rawToken);
-  } catch {
-    return rawToken;
-  }
 }
 
 async function extractCookieDFromBrave(): Promise<string> {
@@ -235,7 +148,7 @@ async function extractCookieDFromBrave(): Promise<string> {
 
   for (const password of passwords) {
     try {
-      const decrypted = decryptChromiumCookieValue(data, password);
+      const decrypted = decryptChromiumCookieValue(data, password, 1003);
       const match = decrypted.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
       if (match) {
         return match[0]!;

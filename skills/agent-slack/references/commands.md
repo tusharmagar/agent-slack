@@ -58,9 +58,11 @@ Run `agent-slack --help` (or `agent-slack <command> --help`) for the full option
 - `agent-slack message send <target> <text>`
   - If `<target>` is a Slack message URL, replies in that message’s thread.
   - Otherwise posts to the channel/DM.
+  - Bullet lists (`- `, `* `, `• `, `1. `, etc.) are automatically converted to Slack’s native rich text format, so recipients see real editable bullets instead of plain-text dashes.
   - Options:
     - `--workspace <url-or-unique-substring>` (needed for channel _names_ across multiple workspaces)
     - `--thread-ts <seconds>.<micros>` (optional, channel mode only)
+    - `--attach <path>` (repeatable; upload local files as attachments)
 
 - `agent-slack message edit <target> <text>`
   - URL target edits that exact message.
@@ -123,3 +125,4 @@ Common options:
 
 - `agent-slack user list [--workspace <url-or-unique-substring>] [--limit <n>] [--cursor <cursor>] [--include-bots]`
 - `agent-slack user get <U...|@handle|handle> [--workspace <url-or-unique-substring>]`
+- `agent-slack user dm-open <users...> [--workspace <url-or-unique-substring>]` — get DM or group DM channel ID for one or more users (max 8)

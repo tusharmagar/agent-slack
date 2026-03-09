@@ -36,14 +36,22 @@ export async function listUsers(
         const members = asArray(resp.members).filter(isRecord);
         for (const m of members) {
           const id = getString(m.id);
-          if (!id) continue;
-          if (!includeBots && m.is_bot) continue;
+          if (!id) {
+            continue;
+          }
+          if (!includeBots && m.is_bot) {
+            continue;
+          }
           users.push(toCompactUser(m));
-          if (users.length >= limit) break;
+          if (users.length >= limit) {
+            break;
+          }
         }
         const meta = isRecord(resp.response_metadata) ? resp.response_metadata : null;
         const next = meta ? getString(meta.next_cursor) : undefined;
-        if (!next) break;
+        if (!next) {
+          break;
+        }
         cursor = next;
         next_cursor = next;
       }
@@ -54,7 +62,9 @@ export async function listUsers(
 
   for (const u of out) {
     const dmId = dmMap.get(u.id);
-    if (dmId) u.dm_id = dmId;
+    if (dmId) {
+      u.dm_id = dmId;
+    }
   }
 
   return { users: out, next_cursor };
@@ -148,14 +158,64 @@ async function fetchDmMap(client: SlackApiClient): Promise<Map<string, string>> 
     for (const ch of channels) {
       const id = getString(ch.id);
       const user = getString(ch.user);
-      if (id && user) map.set(user, id);
+      if (id && user) {
+        map.set(user, id);
+      }
     }
     const meta = isRecord(resp.response_metadata) ? resp.response_metadata : null;
     const next = meta ? getString(meta.next_cursor) : undefined;
-    if (!next) break;
+    if (!next) {
+      break;
+    }
     cursor = next;
   }
   return map;
+}
+
+export async function getDmChannelForUsers(
+  client: SlackApiClient,
+  inputs: string[],
+): Promise<{ user_ids: string[]; dm_channel_id: string; channel_type: "dm" | "group_dm" }> {
+  if (!inputs || inputs.length === 0) {
+    throw new Error("At least one user is required");
+  }
+
+  if (inputs.length > 8) {
+    throw new Error("Slack supports a maximum of 8 users in a group DM");
+  }
+
+  const userIds: string[] = [];
+  for (const input of inputs) {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const userId = await resolveUserId(client, trimmed);
+    if (!userId) {
+      throw new Error(`Could not resolve user: ${input}`);
+    }
+    userIds.push(userId);
+  }
+
+  if (userIds.length === 0) {
+    throw new Error("No valid users provided");
+  }
+
+  const resp = await client.api("conversations.open", { users: userIds.join(",") });
+  const channel = isRecord(resp.channel) ? resp.channel : null;
+  const channelId = channel ? getString(channel.id) : null;
+
+  if (!channelId) {
+    throw new Error("conversations.open returned no channel");
+  }
+
+  const channelType = channelId.startsWith("D") ? "dm" : "group_dm";
+
+  return {
+    user_ids: userIds,
+    dm_channel_id: channelId,
+    channel_type: channelType,
+  };
 }
 
 function toCompactUser(u: Record<string, unknown>): CompactSlackUser {
@@ -163,7 +223,7 @@ function toCompactUser(u: Record<string, unknown>): CompactSlackUser {
   return {
     id: getString(u.id) ?? "",
     name: getString(u.name) ?? undefined,
-    real_name: getString(u.real_name) ?? undefined,
+    real_name: getString(u.real_name) ?? getString(profile.real_name) ?? undefined,
     display_name: getString(profile.display_name) ?? undefined,
     email: getString(profile.email) ?? undefined,
     title: getString(profile.title) ?? undefined,
